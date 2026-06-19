@@ -219,8 +219,6 @@ sh /Users/mustangym/SovietExtension/SovietExtension/Rely/uninstall.sh
 ## Thanks / 致谢
 
 感谢湖畔大学全体同学。
-感谢所有开源共产主义战士。
-感谢每一个没有收费、没有割韭菜、没有搞订阅制的理想主义项目。
 
 **瑞思拜。**
 
