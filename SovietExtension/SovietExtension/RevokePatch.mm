@@ -18,20 +18,17 @@
 #import <stdint.h>
 #import <stdarg.h>
 #import <objc/runtime.h>
-#import <objc/message.h>
 #import "MenuManager.h"
 #import "NSObject+MainHook.h"
 
 #include <string>
-#include <time.h>
 #include <atomic>
 
 #pragma mark - 全局状态
 
 static BOOL YMHasPatchedAntiRevoke = NO;
 static BOOL YMIsTargetWeChatResourceDylibPath(NSString *imagePath);
-// 当前 /Applications/WeChat.app/Contents/Resources/wechat.dylib 的 ASLR slide。
-// dyld 加载 wechat.dylib 后会赋值。
+// wechat.dylib 的 slide，dyld 加载后填。
 static uintptr_t YMWeChatDylibSlide = 0;
 
 // 多开 Patch 状态
@@ -43,7 +40,7 @@ static BOOL YMHasPatchedGroupExitMonitor = NO;
 
 //static const uintptr_t YMMultiOpenTryPreventMultiInstanceVA = 0x1C0A64;
 
-// 先声明，后面 constructor、multi open、anti revoke、群员退群监控都会用。
+// 前置声明，下面几个 patch 都要用。
 static void YMDyldImageAdded(const struct mach_header *mh, intptr_t vmaddr_slide);
 static void YMRegisterDyldCallbackIfNeeded(void);
 static void YMInstallMultiOpenPatch(void);
@@ -255,8 +252,7 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
 
 static const size_t YMAdaptProfilesCount = sizeof(YMAdaptProfiles) / sizeof(YMAdaptProfiles[0]);
 
-// 当前运行版本匹配到的配置。
-// 后面所有地址都从这里取，不再写死单个 YMCurrentProfile。
+// 当前命中的版本配置，后面地址都从这里拿。
 static const YMWeChatAdaptProfile *YMActiveProfile = NULL;
 
 #pragma mark - 微信内部函数类型
@@ -268,15 +264,6 @@ typedef int64_t (*YMInsertPaySysMsgToSessionFunc)(int64_t a1,
                                                   const std::string *session,
                                                   const std::string *content);
 
-/*
- paymsg / red_envelope 反编译里表现为：
-   ym_AddLocalMessageWrap(v39[0], v32);
-
- 所以这里按两个参数声明：
-   messageService = v39[0]
-   message        = MessageWrap*
- */
-typedef int64_t (*YMAddLocalMessageWrapFunc)(int64_t messageService, void *message);
 
 #pragma mark - 退群相关
 typedef int64_t (*YMGroupExitDBApplyFunc)(int64_t task);
@@ -408,20 +395,6 @@ static BOOL YMSafeReadPointer(uintptr_t address, uintptr_t *value) {
     return YES;
 }
 
-static BOOL YMSafeReadUInt32(uintptr_t address, uint32_t *value) {
-    if (!value) {
-        return NO;
-    }
-
-    uint32_t tmp = 0;
-    if (!YMSafeReadMemory(address, &tmp, sizeof(tmp))) {
-        return NO;
-    }
-
-    *value = tmp;
-    return YES;
-}
-
 /*
  读取微信内部 libc++ std::string 对象。
  反编译里常见判断：
@@ -435,10 +408,7 @@ static NSString *YMNSStringFromLibcppStringObject(const void *stringObject) {
         return @"";
     }
 
-    /*
-     注意：这里不能直接解引用微信内部指针。
-     如果偏移猜错，普通 try/catch 捕获不了 EXC_BAD_ACCESS，所以统一用 vm_read_overwrite 做安全读。
-     */
+    // 微信里的野指针别直接怼，读错了 try/catch 也救不了。
     uint8_t header[24] = {0};
     uintptr_t objectAddress = (uintptr_t)stringObject;
     if (!YMSafeReadMemory(objectAddress, header, sizeof(header))) {
@@ -584,90 +554,8 @@ static BOOL YMIsTargetWeChatVersion(void) {
     return YES;
 }
 
-#pragma mark - C++ std::string 辅助
-
-/*
- 第一版先默认使用纯文本系统消息。
- 老版 WeChatExtension 也是类似逻辑：msgType=10000 + content 文案。
- 如果纯文本不显示，再把这里改成 XML 版本测试。
- */
-__attribute__((unused))
-static std::string YMBuildAntiRevokeSystemContent(void) {
-    return YMStdStringFromNSString(@"已拦截到一条撤回消息");
-}
-
-/*
- 备用 XML 版本。
- 如果纯文本版本插入了但 UI 不显示，可以把 YMBuildAntiRevokeSystemContent()
- 里 return 改成这个函数。
- */
-__attribute__((unused))
-static std::string YMBuildAntiRevokeSystemXMLContent(void) {
-    std::string text = YMStdStringFromNSString(@"已拦截到一条撤回消息");
-
-    std::string xml;
-    xml += "<?xml version=\"1.0\"?>\n";
-    xml += "<sysmsg type=\"paymsg\">";
-    xml += "<content><![CDATA[";
-    xml += text;
-    xml += "]]></content>";
-    xml += "</sysmsg>";
-
-    return xml;
-}
-
-#pragma mark - shared_ptr 释放辅助
-
-/*
- 微信内部大量使用 libc++ shared_ptr。
- 反编译中一般是：
-   if (control && !atomic_fetch_add(control + 8, -1)) {
-       control->__on_zero_shared(control);
-       std::__shared_weak_count::__release_weak(control);
-   }
-
- 这里第一版只用于自己栈上临时 shared_ptr 的释放。
- 如果测试阶段担心这里有风险，可以临时把调用 YMReleaseSharedPtrStorage 的地方注释掉。
- */
-__attribute__((unused))
-static void YMReleaseSharedPtrStorage(void *storage) {
-    if (!storage) {
-        return;
-    }
-
-    void **items = (void **)storage;
-    void *controlBlock = items[1];
-
-    items[0] = NULL;
-    items[1] = NULL;
-
-    if (!controlBlock) {
-        return;
-    }
-
-    // libc++ shared_count 的 shared_owners_ 通常在 controlBlock + 8。
-    volatile long *sharedOwners = (volatile long *)((uint8_t *)controlBlock + 8);
-    long oldValue = __atomic_fetch_add(sharedOwners, -1, __ATOMIC_ACQ_REL);
-
-    // 反编译里的判断是 oldValue == 0 时释放。
-    if (oldValue == 0) {
-        void **vtable = *(void ***)controlBlock;
-
-        // vtable[2] 通常对应 __on_zero_shared()
-        if (vtable && vtable[2]) {
-            typedef void (*OnZeroSharedFunc)(void *);
-            ((OnZeroSharedFunc)vtable[2])(controlBlock);
-        }
-
-        // vtable[3] 通常对应 __on_zero_shared_weak()
-        if (vtable && vtable[3]) {
-            typedef void (*OnZeroSharedWeakFunc)(void *);
-            ((OnZeroSharedWeakFunc)vtable[3])(controlBlock);
-        }
-    }
-}
-
 #pragma mark - MessageWrap 字段读取
+
 
 static std::string *YMRawWrapStringField(void *rawWrap, size_t offset) {
     if (!rawWrap) {
@@ -714,19 +602,161 @@ static NSString *YMFormatTimestamp(uint32_t createTimeSec, uint64_t createTimeMs
     return [formatter stringFromDate:messageDate] ?: @"";
 }
 
+static NSString *YMExtractXMLTagValue(NSString *xml, NSString *tag) {
+    if (xml.length == 0 || tag.length == 0) {
+        return @"";
+    }
+
+    NSString *openTag = [NSString stringWithFormat:@"<%@>", tag];
+    NSString *closeTag = [NSString stringWithFormat:@"</%@>", tag];
+
+    NSRange openRange = [xml rangeOfString:openTag options:NSCaseInsensitiveSearch];
+    if (openRange.location == NSNotFound) {
+        return @"";
+    }
+
+    NSUInteger valueStart = NSMaxRange(openRange);
+    if (valueStart >= xml.length) {
+        return @"";
+    }
+
+    NSRange searchRange = NSMakeRange(valueStart, xml.length - valueStart);
+    NSRange closeRange = [xml rangeOfString:closeTag options:NSCaseInsensitiveSearch range:searchRange];
+    if (closeRange.location == NSNotFound || closeRange.location < valueStart) {
+        return @"";
+    }
+
+    NSString *value = [xml substringWithRange:NSMakeRange(valueStart, closeRange.location - valueStart)] ?: @"";
+    value = [value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+
+    if ([value hasPrefix:@"<![CDATA["] && [value hasSuffix:@"]]>"] && value.length >= 12) {
+        value = [value substringWithRange:NSMakeRange(9, value.length - 12)] ?: @"";
+    }
+
+    return [value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
+}
+
+static NSString *YMRevokerWxidFromRevokeXMLPrefix(NSString *xml) {
+    if (xml.length == 0) {
+        return @"";
+    }
+
+    NSRange sysmsgRange = [xml rangeOfString:@"<sysmsg" options:NSCaseInsensitiveSearch];
+    if (sysmsgRange.location == NSNotFound || sysmsgRange.location == 0) {
+        return @"";
+    }
+
+    NSString *prefix = [[xml substringToIndex:sysmsgRange.location]
+        stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if ([prefix hasSuffix:@":"]) {
+        prefix = [prefix substringToIndex:prefix.length - 1];
+    }
+
+    if ([prefix hasPrefix:@"wxid_"] || prefix.length > 0) {
+        return prefix;
+    }
+    return @"";
+}
+
+static NSString *YMDisplayNameFromRevokeReplaceMsg(NSString *replaceMsg) {
+    if (replaceMsg.length == 0) {
+        return @"";
+    }
+
+    NSRange firstQuote = [replaceMsg rangeOfString:@"\""];
+    if (firstQuote.location != NSNotFound) {
+        NSRange searchRange = NSMakeRange(NSMaxRange(firstQuote), replaceMsg.length - NSMaxRange(firstQuote));
+        NSRange secondQuote = [replaceMsg rangeOfString:@"\"" options:0 range:searchRange];
+        if (secondQuote.location != NSNotFound && secondQuote.location > NSMaxRange(firstQuote)) {
+            NSString *name = [replaceMsg substringWithRange:NSMakeRange(NSMaxRange(firstQuote), secondQuote.location - NSMaxRange(firstQuote))];
+            name = [name stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (name.length > 0) {
+                return name;
+            }
+        }
+    }
+
+    NSString *name = [replaceMsg copy];
+    for (NSString *suffix in @[@"撤回了一条消息", @"撤回了消息", @"recalled a message"]) {
+        NSRange range = [name rangeOfString:suffix options:NSCaseInsensitiveSearch];
+        if (range.location != NSNotFound) {
+            name = [name substringToIndex:range.location];
+            break;
+        }
+    }
+
+    name = [[name stringByReplacingOccurrencesOfString:@"\"" withString:@""]
+        stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return name ?: @"";
+}
+
+static NSString *YMFindRevokeXMLFromRawWrap(void *rawWrap, size_t wrapSize) {
+    if (!rawWrap || wrapSize < 24) {
+        return @"";
+    }
+
+    /*
+     4.1.10 这里就是 +304，不能读328
+     后面再扫一遍，防止小版本偏移抽风。
+     */
+    const size_t preferredOffsets[] = {304, 328, 352, 376, 400, 424, 448, 280, 248, 224, 200};
+    for (size_t i = 0; i < sizeof(preferredOffsets) / sizeof(preferredOffsets[0]); i++) {
+        size_t offset = preferredOffsets[i];
+        if (offset + 24 > wrapSize) {
+            continue;
+        }
+        NSString *value = YMNSStringFromLibcppStringObject((uint8_t *)rawWrap + offset);
+        NSString *lower = value.lowercaseString;
+        if ([lower containsString:@"<sysmsg"] && [lower containsString:@"revokemsg"]) {
+            YMLog(@"raw revoke xml found at preferred offset +%zu", offset);
+            return value ?: @"";
+        }
+    }
+
+    for (size_t offset = 0; offset + 24 <= wrapSize; offset += 8) {
+        NSString *value = YMNSStringFromLibcppStringObject((uint8_t *)rawWrap + offset);
+        if (value.length == 0) {
+            continue;
+        }
+        NSString *lower = value.lowercaseString;
+        if ([lower containsString:@"<sysmsg"] && [lower containsString:@"revokemsg"]) {
+            YMLog(@"raw revoke xml found by scan at offset +%zu", offset);
+            return value ?: @"";
+        }
+    }
+
+    return @"";
+}
+
 static NSString *YMBuildAntiRevokeNoticeText(NSString *remoteUserOrSession,
                                              NSString *selfUser,
                                              NSString *messageTimeText,
-                                             int64_t rawRevokeMessage) {
-    /*
-     这里是最终插入聊天流的灰色提示文案。
-     以后如果想精简，可以只保留第一行和消息时间。
-     */
-    return [NSString stringWithFormat:
-            @"⚠️苏维埃已拦截撤回消息⚠️\n撤回方/会话：%@\n%@",
-            remoteUserOrSession ?: @"",
-            messageTimeText ?: @""
-           ];
+                                             NSString *revokerWxid,
+                                             NSString *replaceMsg,
+                                             NSString *revokeSession,
+                                             NSString *msgID,
+                                             NSString *newMsgID) {
+    NSString *displayName = YMDisplayNameFromRevokeReplaceMsg(replaceMsg);
+    NSString *session = revokeSession.length > 0 ? revokeSession : (remoteUserOrSession ?: @"");
+
+    NSMutableString *text = [NSMutableString string];
+    [text appendString:@"⚠️苏维埃已拦截撤回消息⚠️\n"];
+
+    if (displayName.length > 0 && revokerWxid.length > 0) {
+        [text appendFormat:@"%@（%@）\n", displayName, revokerWxid];
+    } else if (displayName.length > 0) {
+        [text appendFormat:@"%@\n", displayName];
+    } else if (revokerWxid.length > 0) {
+        [text appendFormat:@"%@\n", revokerWxid];
+    } else {
+        [text appendFormat:@"撤回方/会话：%@\n", remoteUserOrSession ?: @""];
+    }
+
+    if (messageTimeText.length > 0) {
+        [text appendString:messageTimeText];
+    }
+
+    return text;
 }
 
 #pragma mark - 内存写入
@@ -1006,12 +1036,10 @@ static BOOL YMPatchARM64AbsoluteJump(uintptr_t address,
  参数 rawRevokeMessage：
    这是 ym_HandleSysMsg_RevokeMsg 原函数的第二个参数 X1。
    原函数会用 sub_4728670(rawWrap, rawRevokeMessage) 构造一个 MessageWrap。
-
  复用这一步，主要是为了拿到会话相关字段：
    rawWrap + 24
    rawWrap + 48
-
- 然后构造自己的 type=10000 MessageWrap 插入本地聊天流。
+ 构造 type=10000 MessageWrap 插入本地聊天流。
  */
 static BOOL YMInsertLocalAntiRevokeNotice(int64_t rawRevokeMessage) {
     const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
@@ -1118,10 +1146,43 @@ static BOOL YMInsertLocalAntiRevokeNotice(int64_t rawRevokeMessage) {
 
         NSString *messageTimeText = YMFormatTimestamp(rawCreateTimeSec, rawCreateTimeMs);
 
+        std::string *rawField72 = YMRawWrapStringField(rawWrap, 72);
+        NSString *revokerWxid = YMNSStringFromStdString(rawField72);
+        NSString *revokeXML = YMFindRevokeXMLFromRawWrap(rawWrap, wrapSize);
+
+        if (revokerWxid.length == 0) {
+            revokerWxid = YMRevokerWxidFromRevokeXMLPrefix(revokeXML);
+        }
+
+        NSString *revokeSession = YMExtractXMLTagValue(revokeXML, @"session");
+        NSString *msgID = YMExtractXMLTagValue(revokeXML, @"msgid");
+        NSString *newMsgID = YMExtractXMLTagValue(revokeXML, @"newmsgid");
+        NSString *replaceMsg = YMExtractXMLTagValue(revokeXML, @"replacemsg");
+
+        YMLog(@"raw field72=%s", rawField72 ? rawField72->c_str() : "");
+        YMLog(@"raw revoke xml=%@", revokeXML ?: @"");
+        YMLog(@"revoke parsed session=%@ msgid=%@ newmsgid=%@ revoker=%@ replace=%@ displayName=%@",
+              revokeSession ?: @"",
+              msgID ?: @"",
+              newMsgID ?: @"",
+              revokerWxid ?: @"",
+              replaceMsg ?: @"",
+              YMDisplayNameFromRevokeReplaceMsg(replaceMsg) ?: @"");
+
         NSString *noticeText = YMBuildAntiRevokeNoticeText(remoteUserOrSessionText,
                                                            selfUserText,
                                                            messageTimeText,
-                                                           rawRevokeMessage);
+                                                           revokerWxid,
+                                                           replaceMsg,
+                                                           revokeSession,
+                                                           msgID,
+                                                           newMsgID);
+
+        if (noticeText.length == 0) {
+            noticeText = [NSString stringWithFormat:@"⚠️苏维埃已拦截撤回消息⚠️\n会话：%@\n%@",
+                          remoteUserOrSessionText ?: @"",
+                          messageTimeText ?: @""];
+        }
 
         std::string content = YMStdStringFromNSString(noticeText);
 
@@ -2278,13 +2339,7 @@ static BOOL YMPatchMultiOpenWithWeChatDylibSlide(intptr_t slide, NSString *sourc
           (unsigned long)tryPreventAddress,
           (unsigned long)processCountAddress);
 
-    /*
-     多开需要尽量同时绕过两层：
-       1. TryPreventMultiInstance：启动早期防多开逻辑。
-       2. GetMainWeixinProcessCount：通过 NSRunningApplication 统计同 BundleID 进程数量。
-          4.1.10 如果不 patch 这个函数，第二个微信实例会检测到已有进程，
-          很容易进入反复授权 / 防多开流程。
-     */
+    
     BOOL patchedAny = NO;
     BOOL finalOK = YES;
 
@@ -2433,61 +2488,6 @@ static void YMRegisterDyldCallbackIfNeeded(void) {
     YMLog(@"register dyld add image callback");
     _dyld_register_func_for_add_image(YMDyldImageAdded);
 }
-
-#pragma mark - 功能安装
-
-static void YMInstallAssistantMenu(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        [[MenuManager shareInstance] initAssistantMenuItems];
-    });
-}
-
-static void YMInstallAntiUpdateIfNeeded(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        NSString *loadFlag = [[NSUserDefaults standardUserDefaults] objectForKey:kIsFirstLoad];
-        if (loadFlag.length < 3) {
-            [[NSUserDefaults standardUserDefaults] setBool:YES forKey:kAntiUpdate];
-            [[NSUserDefaults standardUserDefaults] setObject:@"SOVIET" forKey:kIsFirstLoad];
-        }
-
-        if ([[NSUserDefaults standardUserDefaults] boolForKey:kAntiUpdate]) {
-            YMDisableSparkleAutoUpdateDefaults();
-            YMDisableSparkleByRuntimeHook();
-        }
-    });
-}
-
-static void YMInstallAntiRevokeIfNeeded(void) {
-    if (![[NSUserDefaults standardUserDefaults] boolForKey:kAntiRevoke]) {
-        YMLog(@"anti revoke disabled by user defaults, skip");
-        return;
-    }
-
-    /*
-     先注册 dyld 回调。
-     如果 wechat.dylib 在之后加载，可以第一时间拿到 slide。
-    */
-    YMRegisterDyldCallbackIfNeeded();
-
-    /*
-     再主动扫描一次。
-     如果 wechat.dylib 在之前已经加载，可以直接安装 hook。
-    */
-    YMInstallAntiRevokePatch();
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        YMInstallAntiRevokePatch();
-    });
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        YMInstallAntiRevokePatch();
-    });
-}
-
 
 #pragma mark - constructor
 
