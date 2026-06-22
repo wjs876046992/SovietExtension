@@ -10,8 +10,9 @@
 NS_ASSUME_NONNULL_BEGIN
 static NSString *kAntiUpdate = @"kAntiUpdate.SOVIET";
 static NSString *kAntiRevoke = @"kAntiRevoke.SOVIET";
+static NSString *kExitChatroom = @"kExitChatroom.SOVIET";
 static NSString *kIsFirstLoad = @"kIsFirstLoad.SOVIET";
-static NSString *kCurrentVersion = @"1.0.2";
+static NSString *kCurrentVersion = @"1.0.3";
 
 @interface MenuManager : NSObject
 + (void)hook;

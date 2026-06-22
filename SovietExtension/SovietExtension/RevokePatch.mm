@@ -29,7 +29,7 @@
 #pragma mark - 全局状态
 
 static BOOL YMHasPatchedAntiRevoke = NO;
-
+static BOOL YMIsTargetWeChatResourceDylibPath(NSString *imagePath);
 // 当前 /Applications/WeChat.app/Contents/Resources/wechat.dylib 的 ASLR slide。
 // dyld 加载 wechat.dylib 后会赋值。
 static uintptr_t YMWeChatDylibSlide = 0;
@@ -38,12 +38,16 @@ static uintptr_t YMWeChatDylibSlide = 0;
 static BOOL YMHasPatchedMultiOpenResourceDylib = NO;
 static BOOL YMHasRegisteredDyldCallback = NO;
 
+// 群员退群监控 Patch 状态
+static BOOL YMHasPatchedGroupExitMonitor = NO;
+
 //static const uintptr_t YMMultiOpenTryPreventMultiInstanceVA = 0x1C0A64;
 
-// 先声明，后面 constructor 和 anti revoke 都会用。
+// 先声明，后面 constructor、multi open、anti revoke、群员退群监控都会用。
 static void YMDyldImageAdded(const struct mach_header *mh, intptr_t vmaddr_slide);
 static void YMRegisterDyldCallbackIfNeeded(void);
 static void YMInstallMultiOpenPatch(void);
+static void YMInstallGroupExitMonitorPatch(void);
 
 typedef enum {
     YMRevokeHookModePointer = 0,   // 4.1.9：写 off_91EAD20
@@ -103,6 +107,10 @@ typedef struct {
     uintptr_t YMMultiOpenTryPreventMultiInstanceVA;
     uintptr_t YMGetMainWeixinProcessCountVA;
 
+    uintptr_t groupExitDBApplyVA;
+    uintptr_t groupExitFMessagePreVA;
+    uintptr_t groupExitUpdateSessionCacheVA;
+
     YMMessageWrapLayout layout;
     
     YMRevokeHookMode hookMode;//4.1.10添加
@@ -138,6 +146,11 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
         .YMMultiOpenTryPreventMultiInstanceVA = 0x1C0A64,
         // 4.1.9 暂时没有适配这个进程数量检测点，填 0 表示跳过。
         .YMGetMainWeixinProcessCountVA = 0x449E2BC,
+
+        // 群员退群监控 4.1.9 暂未适配，填 0 自动跳过。
+        .groupExitDBApplyVA = 0,
+        .groupExitFMessagePreVA = 0,
+        .groupExitUpdateSessionCacheVA = 0,
 
         .layout = {
             .messageWrapSize = 616,
@@ -182,6 +195,14 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
         // GetMainWeixinProcessCount：统计当前 BundleID 的微信进程数量
         .YMGetMainWeixinProcessCountVA = 0x449E2BC,
 
+        //数据库层, chatroom_member
+        .groupExitDBApplyVA = 0x225355C,
+
+        //yq
+        .groupExitFMessagePreVA = 0x250EE44,
+        //yq
+        .groupExitUpdateSessionCacheVA = 0x37EACC0,
+
         .layout = {
             .messageWrapSize = 616,
 
@@ -212,6 +233,10 @@ static const YMWeChatAdaptProfile YMAdaptProfiles[] = {
          .insertPaySysMsgToSessionVA = 新版地址,
          .YMMultiOpenTryPreventMultiInstanceVA = 新版多开入口地址,
          .YMGetMainWeixinProcessCountVA = 新版进程数量检测地址，没有就填 0,
+
+         .groupExitDBApplyVA = 新版 chatroom_member DB apply 函数入口地址，没有就填 0,
+         .groupExitFMessagePreVA = 新版 InsertFMessageToSessionPre 函数入口地址，没有就填 0,
+         .groupExitUpdateSessionCacheVA = 新版 UpdateSessionCache 函数入口地址，没有就填 0,
 
          .layout = {
              .messageWrapSize = 616,
@@ -252,6 +277,39 @@ typedef int64_t (*YMInsertPaySysMsgToSessionFunc)(int64_t a1,
    message        = MessageWrap*
  */
 typedef int64_t (*YMAddLocalMessageWrapFunc)(int64_t messageService, void *message);
+
+#pragma mark - 退群相关
+typedef int64_t (*YMGroupExitDBApplyFunc)(int64_t task);
+typedef void (*YMGroupExitFMessagePreFunc)(int64_t a1, int64_t *a2);
+typedef void (*YMGroupExitUpdateSessionCacheFunc)(uint64_t a1, int64_t a2, int64_t a3, int a4);
+
+static uintptr_t YMGroupExitDBApplyRuntimeAddress = 0;
+static uint8_t YMGroupExitOriginalDBApplyBytes[16] = {0};
+static uint8_t YMGroupExitHookDBApplyBytes[16] = {0};
+static BOOL YMGroupExitHasSavedOriginalDBApplyBytes = NO;
+
+static uintptr_t YMGroupExitFMessagePreRuntimeAddress = 0;
+static uint8_t YMGroupExitOriginalFMessagePreBytes[16] = {0};
+static uint8_t YMGroupExitHookFMessagePreBytes[16] = {0};
+static BOOL YMGroupExitHasSavedOriginalFMessagePreBytes = NO;
+
+static uintptr_t YMGroupExitUpdateSessionCacheRuntimeAddress = 0;
+static uint8_t YMGroupExitOriginalUpdateSessionCacheBytes[16] = {0};
+static uint8_t YMGroupExitHookUpdateSessionCacheBytes[16] = {0};
+static BOOL YMGroupExitHasSavedOriginalUpdateSessionCacheBytes = NO;
+
+static std::atomic_bool YMGroupExitCallingOriginalDBApply(false);
+static std::atomic_bool YMGroupExitCallingOriginalFMessagePre(false);
+static std::atomic_bool YMGroupExitCallingOriginalUpdateSessionCache(false);
+static std::atomic_bool YMGroupExitFlushingPending(false);
+
+// 统一读取退群监控开关。
+// 注意：安装 hook 前要判断；hook 已经安装后也要在 hook 内判断。
+// 因为 ARM64 inline hook 一旦写入当前进程，单纯把 NSUserDefaults 改成 false，
+// 已经安装的 hook 不会自动消失。
+static BOOL YMIsGroupExitMonitorEnabled(void) {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:kExitChatroom];
+}
 
 #pragma mark - 日志
 
@@ -318,6 +376,108 @@ static NSString *YMNSStringFromStdString(const std::string *value) {
     }
 
     return [NSString stringWithUTF8String:cString] ?: @"";
+}
+
+
+static BOOL YMSafeReadMemory(uintptr_t address, void *buffer, size_t size) {
+    if (address == 0 || !buffer || size == 0) {
+        return NO;
+    }
+
+    vm_size_t outSize = 0;
+    kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                                         (vm_address_t)address,
+                                         (vm_size_t)size,
+                                         (vm_address_t)buffer,
+                                         &outSize);
+
+    return kr == KERN_SUCCESS && outSize == size;
+}
+
+static BOOL YMSafeReadPointer(uintptr_t address, uintptr_t *value) {
+    if (!value) {
+        return NO;
+    }
+
+    uintptr_t tmp = 0;
+    if (!YMSafeReadMemory(address, &tmp, sizeof(tmp))) {
+        return NO;
+    }
+
+    *value = tmp;
+    return YES;
+}
+
+static BOOL YMSafeReadUInt32(uintptr_t address, uint32_t *value) {
+    if (!value) {
+        return NO;
+    }
+
+    uint32_t tmp = 0;
+    if (!YMSafeReadMemory(address, &tmp, sizeof(tmp))) {
+        return NO;
+    }
+
+    *value = tmp;
+    return YES;
+}
+
+/*
+ 读取微信内部 libc++ std::string 对象。
+ 反编译里常见判断：
+   *(char *)(str + 23) >= 0  => 短字符串，长度在 +23，内容从对象起始处读。
+   *(char *)(str + 23) <  0  => 长字符串，data 在 +0，length 在 +8。
+
+ 这个函数只读，不析构，不接管所有权。
+ */
+static NSString *YMNSStringFromLibcppStringObject(const void *stringObject) {
+    if (!stringObject) {
+        return @"";
+    }
+
+    /*
+     注意：这里不能直接解引用微信内部指针。
+     如果偏移猜错，普通 try/catch 捕获不了 EXC_BAD_ACCESS，所以统一用 vm_read_overwrite 做安全读。
+     */
+    uint8_t header[24] = {0};
+    uintptr_t objectAddress = (uintptr_t)stringObject;
+    if (!YMSafeReadMemory(objectAddress, header, sizeof(header))) {
+        return @"";
+    }
+
+    int8_t flag = *(const int8_t *)(header + 23);
+
+    const char *data = NULL;
+    size_t length = 0;
+    uint8_t stackBuffer[4096] = {0};
+
+    if (flag >= 0) {
+        length = (uint8_t)flag;
+        if (length == 0 || length > 23) {
+            return @"";
+        }
+        memcpy(stackBuffer, header, length);
+        data = (const char *)stackBuffer;
+    } else {
+        uintptr_t remoteData = 0;
+        memcpy(&remoteData, header, sizeof(remoteData));
+        memcpy(&length, header + 8, sizeof(length));
+
+        if (remoteData == 0 || length == 0 || length >= sizeof(stackBuffer)) {
+            return @"";
+        }
+
+        if (!YMSafeReadMemory(remoteData, stackBuffer, length)) {
+            return @"";
+        }
+
+        data = (const char *)stackBuffer;
+    }
+
+    NSString *value = [[NSString alloc] initWithBytes:data
+                                              length:length
+                                            encoding:NSUTF8StringEncoding];
+    return value ?: @"";
 }
 
 #pragma mark - Profile 匹配
@@ -991,13 +1151,958 @@ static BOOL YMInsertLocalAntiRevokeNotice(int64_t rawRevokeMessage) {
     return ok;
 }
 
+#pragma mark - 群员退群监控
+
+static NSMutableDictionary<NSString *, NSSet<NSString *> *> *YMGroupExitMemberCache(void) {
+    static NSMutableDictionary<NSString *, NSSet<NSString *> *> *cache = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cache = [[NSMutableDictionary alloc] init];
+    });
+    return cache;
+}
+
+static NSMutableDictionary<NSString *, NSDate *> *YMGroupExitRecentTipCache(void) {
+    static NSMutableDictionary<NSString *, NSDate *> *cache = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cache = [[NSMutableDictionary alloc] init];
+    });
+    return cache;
+}
+
+static NSMutableArray<NSDictionary<NSString *, id> *> *YMGroupExitPendingNotices(void) {
+    static NSMutableArray<NSDictionary<NSString *, id> *> *queue = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        queue = [[NSMutableArray alloc] init];
+    });
+    return queue;
+}
+
+static void YMGroupExitClearRuntimeStateIfDisabled(const char *source) {
+    if (YMIsGroupExitMonitorEnabled()) {
+        return;
+    }
+
+    NSMutableArray<NSDictionary<NSString *, id> *> *queue = YMGroupExitPendingNotices();
+    @synchronized (queue) {
+        if (queue.count > 0) {
+            YMLog(@"[GroupExitMonitor] disabled, clear pending notices. source=%s count=%lu",
+                  source ?: "",
+                  (unsigned long)queue.count);
+            [queue removeAllObjects];
+        }
+    }
+
+    NSMutableDictionary<NSString *, NSSet<NSString *> *> *memberCache = YMGroupExitMemberCache();
+    @synchronized (memberCache) {
+        if (memberCache.count > 0) {
+            [memberCache removeAllObjects];
+        }
+    }
+
+    NSMutableDictionary<NSString *, NSDate *> *recentTipCache = YMGroupExitRecentTipCache();
+    @synchronized (recentTipCache) {
+        if (recentTipCache.count > 0) {
+            [recentTipCache removeAllObjects];
+        }
+    }
+}
+
+static BOOL YMGroupExitProfileReady(const YMWeChatAdaptProfile *profile) {
+    if (!profile) {
+        return NO;
+    }
+
+    return profile->groupExitDBApplyVA != 0 &&
+           profile->groupExitFMessagePreVA != 0 &&
+           profile->groupExitUpdateSessionCacheVA != 0;
+}
+
+static BOOL YMGroupExitIsChatRoomID(NSString *roomID) {
+    if (roomID.length == 0) {
+        return NO;
+    }
+
+    return [roomID containsString:@"@chatroom"];
+}
+
+static BOOL YMGroupExitMemberIDLooksUseful(NSString *value, NSString *roomID) {
+    if (value.length < 2 || value.length > 128) {
+        return NO;
+    }
+
+    if (roomID.length > 0 && [value isEqualToString:roomID]) {
+        return NO;
+    }
+
+    if ([value containsString:@"@chatroom"]) {
+        return NO;
+    }
+
+    if ([value hasPrefix:@"wxid_"] ||
+        [value hasPrefix:@"gh_"] ||
+        [value containsString:@"@openim"] ||
+        [value containsString:@"@stranger"] ||
+        [value rangeOfString:@"^[A-Za-z0-9_\\-]{5,}$" options:NSRegularExpressionSearch].location != NSNotFound) {
+        return YES;
+    }
+
+    return NO;
+}
+
+static NSString *YMGroupExitDisplayNameForMemberID(NSString *memberID, NSString *roomID) {
+    // 当前这版先保守使用 memberID。后续如果逆出 contact / chatroom nickname 查询函数，再在这里替换成群昵称。
+    if (memberID.length > 0) {
+        return memberID;
+    }
+
+    return @"某成员";
+}
+
+static BOOL YMGroupExitShouldEmitTip(NSString *roomID, NSString *memberID) {
+    if (roomID.length == 0 || memberID.length == 0) {
+        return NO;
+    }
+
+    NSString *key = [NSString stringWithFormat:@"%@|%@", roomID, memberID];
+    NSDate *now = [NSDate date];
+    NSMutableDictionary<NSString *, NSDate *> *cache = YMGroupExitRecentTipCache();
+
+    @synchronized (cache) {
+        NSDate *last = cache[key];
+        // 只防同一次 DB apply / session flush 造成的短时间重复提示。
+        // 成员重新进群时会清掉这个 key，允许后续再次退群提示。
+        if (last && [now timeIntervalSinceDate:last] < 3.0) {
+            return NO;
+        }
+
+        cache[key] = now;
+
+        if (cache.count > 512) {
+            NSArray<NSString *> *allKeys = [cache allKeys];
+            for (NSString *oldKey in allKeys) {
+                NSDate *date = cache[oldKey];
+                if (!date || [now timeIntervalSinceDate:date] > 300.0) {
+                    [cache removeObjectForKey:oldKey];
+                }
+            }
+        }
+    }
+
+    return YES;
+}
+
+static void YMGroupExitClearRecentTip(NSString *roomID, NSString *memberID, NSString *reason) {
+    if (roomID.length == 0 || memberID.length == 0) {
+        return;
+    }
+
+    NSString *key = [NSString stringWithFormat:@"%@|%@", roomID, memberID];
+    NSMutableDictionary<NSString *, NSDate *> *cache = YMGroupExitRecentTipCache();
+
+    @synchronized (cache) {
+        if (cache[key]) {
+            [cache removeObjectForKey:key];
+            YMLog(@"[GroupExitMonitor] recent tip cache cleared. room=%@ member=%@ reason=%@",
+                  roomID,
+                  memberID,
+                  reason ?: @"");
+        }
+    }
+}
+
+static void YMGroupExitEnqueueNotice(NSString *roomID, NSString *memberID, NSString *noticeText) {
+    if (!YMGroupExitIsChatRoomID(roomID) || memberID.length == 0 || noticeText.length == 0) {
+        return;
+    }
+
+    if (!YMGroupExitShouldEmitTip(roomID, memberID)) {
+        YMLog(@"[GroupExitMonitor] duplicate tip suppressed. room=%@ member=%@", roomID, memberID);
+        return;
+    }
+
+    NSString *key = [NSString stringWithFormat:@"%@|%@", roomID, memberID];
+    NSMutableArray<NSDictionary<NSString *, id> *> *queue = YMGroupExitPendingNotices();
+    NSDate *now = [NSDate date];
+
+    @synchronized (queue) {
+        for (NSDictionary<NSString *, id> *item in queue) {
+            NSString *oldKey = item[@"key"];
+            if ([oldKey isEqualToString:key]) {
+                YMLog(@"[GroupExitMonitor] pending duplicate suppressed. room=%@ member=%@", roomID, memberID);
+                return;
+            }
+        }
+
+        NSDictionary<NSString *, id> *item = @{
+            @"key": key,
+            @"roomID": roomID,
+            @"memberID": memberID,
+            @"noticeText": noticeText,
+            @"date": now,
+        };
+
+        [queue addObject:item];
+
+        while (queue.count > 128) {
+            [queue removeObjectAtIndex:0];
+        }
+    }
+
+    YMLog(@"[GroupExitMonitor] notice queued. room=%@ member=%@ notice=%@", roomID, memberID, noticeText);
+}
+
+static NSArray<NSDictionary<NSString *, id> *> *YMGroupExitDrainPendingNotices(NSUInteger maxCount) {
+    NSMutableArray<NSDictionary<NSString *, id> *> *queue = YMGroupExitPendingNotices();
+    NSMutableArray<NSDictionary<NSString *, id> *> *items = [NSMutableArray array];
+
+    @synchronized (queue) {
+        if (queue.count == 0) {
+            return @[];
+        }
+
+        NSUInteger count = MIN(maxCount, queue.count);
+        for (NSUInteger i = 0; i < count; i++) {
+            [items addObject:queue[i]];
+        }
+
+        NSRange range = NSMakeRange(0, count);
+        [queue removeObjectsInRange:range];
+    }
+
+    return [items copy];
+}
+
+static NSDictionary<NSString *, NSSet<NSString *> *> *YMGroupExitReadSnapshotsFromDBApplyTask(int64_t task) {
+    if (task == 0) {
+        return @{};
+    }
+
+    uintptr_t vectorObject = 0;
+    if (!YMSafeReadPointer((uintptr_t)task + 24, &vectorObject)) {
+        YMLog(@"[GroupExitMonitor] DB apply read vector pointer failed. task=0x%llx", (unsigned long long)task);
+        return @{};
+    }
+
+    if (vectorObject == 0 || vectorObject < 0x100000000ULL) {
+        YMLog(@"[GroupExitMonitor] DB apply invalid vector pointer. task=0x%llx vector=0x%lx",
+              (unsigned long long)task,
+              (unsigned long)vectorObject);
+        return @{};
+    }
+
+    uintptr_t begin = 0;
+    uintptr_t end = 0;
+    uintptr_t cap = 0;
+    if (!YMSafeReadPointer(vectorObject + 0, &begin) ||
+        !YMSafeReadPointer(vectorObject + 8, &end) ||
+        !YMSafeReadPointer(vectorObject + 16, &cap)) {
+        YMLog(@"[GroupExitMonitor] DB apply read vector begin/end/cap failed. vector=0x%lx", (unsigned long)vectorObject);
+        return @{};
+    }
+
+    if (begin == 0 || end == 0 || end < begin || cap < end || begin < 0x100000000ULL) {
+        YMLog(@"[GroupExitMonitor] DB apply invalid vector bounds. vector=0x%lx begin=0x%lx end=0x%lx cap=0x%lx",
+              (unsigned long)vectorObject,
+              (unsigned long)begin,
+              (unsigned long)end,
+              (unsigned long)cap);
+        return @{};
+    }
+
+    const size_t entrySize = 80;
+    uintptr_t byteSize = end - begin;
+    if (byteSize == 0 || (byteSize % entrySize) != 0) {
+        YMLog(@"[GroupExitMonitor] DB apply vector size mismatch. vector=0x%lx begin=0x%lx end=0x%lx byteSize=%lu",
+              (unsigned long)vectorObject,
+              (unsigned long)begin,
+              (unsigned long)end,
+              (unsigned long)byteSize);
+        return @{};
+    }
+
+    size_t count = (size_t)(byteSize / entrySize);
+    if (count == 0 || count > 20000) {
+        YMLog(@"[GroupExitMonitor] DB apply unreasonable member count=%zu, skip. vector=0x%lx", count, (unsigned long)vectorObject);
+        return @{};
+    }
+
+    NSMutableDictionary<NSString *, NSMutableSet<NSString *> *> *groups = [NSMutableDictionary dictionary];
+    NSMutableDictionary<NSString *, NSMutableArray<NSString *> *> *samples = [NSMutableDictionary dictionary];
+
+    for (size_t i = 0; i < count; i++) {
+        uintptr_t entry = begin + i * entrySize;
+
+        //LLDB搞出来 ：entry+8 是 roomId，entry+32 是 memberId。
+        NSString *roomID = YMNSStringFromLibcppStringObject((const void *)(entry + 8));
+        NSString *memberID = YMNSStringFromLibcppStringObject((const void *)(entry + 32));
+
+        if (!YMGroupExitIsChatRoomID(roomID)) {
+            continue;
+        }
+
+        if (!YMGroupExitMemberIDLooksUseful(memberID, roomID)) {
+            continue;
+        }
+
+        NSMutableSet<NSString *> *set = groups[roomID];
+        if (!set) {
+            set = [NSMutableSet set];
+            groups[roomID] = set;
+        }
+        [set addObject:memberID];
+
+        NSMutableArray<NSString *> *sample = samples[roomID];
+        if (!sample) {
+            sample = [NSMutableArray array];
+            samples[roomID] = sample;
+        }
+        if (sample.count < 6) {
+            [sample addObject:memberID];
+        }
+    }
+
+    if (groups.count == 0) {
+        YMLog(@"[GroupExitMonitor] DB apply parsed no valid chatroom members. task=0x%llx vector=0x%lx count=%zu",
+              (unsigned long long)task,
+              (unsigned long)vectorObject,
+              count);
+        return @{};
+    }
+
+    NSMutableDictionary<NSString *, NSSet<NSString *> *> *result = [NSMutableDictionary dictionary];
+    for (NSString *roomID in groups) {
+        NSSet<NSString *> *members = [groups[roomID] copy];
+        result[roomID] = members;
+
+        YMLog(@"[GroupExitMonitor] DB apply members room=%@ count=%lu vector=0x%lx samples=%@",
+              roomID,
+              (unsigned long)members.count,
+              (unsigned long)vectorObject,
+              [samples[roomID] componentsJoinedByString:@", "] ?: @"");
+    }
+
+    return [result copy];
+}
+
+static void YMGroupExitHandleDBApplySnapshot(NSString *roomID, NSSet<NSString *> *newSnapshot) {
+    if (!YMGroupExitIsChatRoomID(roomID) || newSnapshot.count == 0) {
+        return;
+    }
+
+    NSMutableArray<NSString *> *leftMembers = [NSMutableArray array];
+    NSMutableArray<NSString *> *addedMembers = [NSMutableArray array];
+    NSMutableDictionary<NSString *, NSSet<NSString *> *> *cache = YMGroupExitMemberCache();
+    NSUInteger oldCount = 0;
+    NSUInteger newCount = newSnapshot.count;
+
+    @synchronized (cache) {
+        NSSet<NSString *> *oldSnapshot = cache[roomID];
+
+        if (oldSnapshot.count == 0) {
+            cache[roomID] = [newSnapshot copy];
+            YMLog(@"[GroupExitMonitor] DB first snapshot stored. room=%@ members=%lu",
+                  roomID,
+                  (unsigned long)newSnapshot.count);
+            return;
+        }
+
+        oldCount = oldSnapshot.count;
+
+        if (![oldSnapshot isEqualToSet:newSnapshot]) {
+            NSMutableSet<NSString *> *removed = [oldSnapshot mutableCopy];
+            [removed minusSet:newSnapshot];
+
+            NSMutableSet<NSString *> *added = [newSnapshot mutableCopy];
+            [added minusSet:oldSnapshot];
+
+            for (NSString *memberID in added) {
+                if (memberID.length > 0) {
+                    [addedMembers addObject:memberID];
+                }
+            }
+
+            // DB apply 层已经是 chatroom_member 写库任务，直接按 confirmed cache 做 diff。
+            // 仍然保留基本安全阈值，避免结构读取异常导致一次性误报大量成员。
+            if (removed.count > 0 && newSnapshot.count < oldSnapshot.count && removed.count <= 20 && removed.count < oldSnapshot.count) {
+                for (NSString *memberID in removed) {
+                    if (memberID.length > 0) {
+                        [leftMembers addObject:memberID];
+                    }
+                }
+            } else if (removed.count > 0) {
+                YMLog(@"[GroupExitMonitor] DB removed set not treated as exit. room=%@ old=%lu new=%lu removed=%lu added=%lu",
+                      roomID,
+                      (unsigned long)oldSnapshot.count,
+                      (unsigned long)newSnapshot.count,
+                      (unsigned long)removed.count,
+                      (unsigned long)added.count);
+            }
+        }
+
+        cache[roomID] = [newSnapshot copy];
+    }
+
+    for (NSString *memberID in addedMembers) {
+        YMGroupExitClearRecentTip(roomID, memberID, @"member appeared in DB snapshot");
+    }
+
+    if (leftMembers.count == 0) {
+        YMLog(@"[GroupExitMonitor] DB snapshot updated, no member left. room=%@ old=%lu new=%lu",
+              roomID,
+              (unsigned long)oldCount,
+              (unsigned long)newCount);
+        return;
+    }
+
+    for (NSString *memberID in leftMembers) {
+        NSString *displayName = YMGroupExitDisplayNameForMemberID(memberID, roomID);
+        NSString *exitTimeText = YMFormatTimestamp(0, 0);
+        NSString *noticeText = [NSString stringWithFormat:@"⚠️苏维埃退群监控⚠️\n%@ 已退群\n%@",
+                                displayName ?: memberID,
+                                exitTimeText ?: @""];
+
+        YMLog(@"[GroupExitMonitor] DB member left detected. room=%@ member=%@ old=%lu new=%lu notice=%@",
+              roomID,
+              memberID,
+              (unsigned long)oldCount,
+              (unsigned long)newCount,
+              noticeText ?: @"");
+
+        YMGroupExitEnqueueNotice(roomID, memberID, noticeText);
+    }
+}
+
+static void YMGroupExitHandleDBApplySnapshots(NSDictionary<NSString *, NSSet<NSString *> *> *snapshots,
+                                              int64_t originalResult) {
+    if (snapshots.count == 0) {
+        return;
+    }
+
+    YMLog(@"[GroupExitMonitor] DB apply original result=0x%llx rooms=%lu",
+          (unsigned long long)originalResult,
+          (unsigned long)snapshots.count);
+
+    for (NSString *roomID in snapshots) {
+        NSSet<NSString *> *members = snapshots[roomID];
+        YMGroupExitHandleDBApplySnapshot(roomID, members);
+    }
+}
+
+static BOOL YMGroupExitInsertLocalSystemNotice(NSString *roomID,
+                                               NSString *noticeText,
+                                               const char *source) {
+    const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
+    if (!profile) {
+        YMLog(@"[GroupExitMonitor] insert failed: no active profile, source=%s", source ?: "");
+        return NO;
+    }
+
+    if (YMWeChatDylibSlide == 0) {
+        YMLog(@"[GroupExitMonitor] insert failed: YMWeChatDylibSlide is zero, source=%s", source ?: "");
+        return NO;
+    }
+
+    if (!YMGroupExitIsChatRoomID(roomID) || noticeText.length == 0) {
+        YMLog(@"[GroupExitMonitor] insert failed: invalid room/content. room=%@ source=%s",
+              roomID ?: @"",
+              source ?: "");
+        return NO;
+    }
+
+    YMInsertPaySysMsgToSessionFunc InsertPaySysMsgToSession =
+    (YMInsertPaySysMsgToSessionFunc)YMRuntimePointer(profile->insertPaySysMsgToSessionVA);
+
+    if (!InsertPaySysMsgToSession) {
+        YMLog(@"[GroupExitMonitor] insert failed: InsertPaySysMsgToSession is NULL, source=%s", source ?: "");
+        return NO;
+    }
+
+    std::string session = YMStdStringFromNSString(roomID);
+    std::string content = YMStdStringFromNSString(noticeText);
+
+    if (session.empty() || content.empty()) {
+        YMLog(@"[GroupExitMonitor] insert failed: std::string empty. room=%@ source=%s",
+              roomID ?: @"",
+              source ?: "");
+        return NO;
+    }
+
+    YMLog(@"[GroupExitMonitor] insert notice source=%s session=%s contentText=%@ contentLen=%zu",
+          source ?: "",
+          session.c_str(),
+          noticeText ?: @"",
+          content.size());
+
+    int64_t result = InsertPaySysMsgToSession(0, &session, &content);
+
+    YMLog(@"[GroupExitMonitor] insert notice result=0x%llx source=%s",
+          (unsigned long long)result,
+          source ?: "");
+
+    return YES;
+}
+
+static void YMGroupExitFlushPendingNotices(const char *source) {
+    if (YMGroupExitFlushingPending.exchange(true)) {
+        return;
+    }
+
+    @autoreleasepool {
+        NSArray<NSDictionary<NSString *, id> *> *items = YMGroupExitDrainPendingNotices(20);
+        if (items.count == 0) {
+            YMGroupExitFlushingPending.store(false);
+            return;
+        }
+
+        YMLog(@"[GroupExitMonitor] flush pending notices source=%s count=%lu",
+              source ?: "",
+              (unsigned long)items.count);
+
+        for (NSDictionary<NSString *, id> *item in items) {
+            NSString *roomID = item[@"roomID"];
+            NSString *memberID = item[@"memberID"];
+            NSString *noticeText = item[@"noticeText"];
+
+            YMLog(@"[GroupExitMonitor] flush notice. room=%@ member=%@ notice=%@",
+                  roomID ?: @"",
+                  memberID ?: @"",
+                  noticeText ?: @"");
+
+            YMGroupExitInsertLocalSystemNotice(roomID,
+                                               noticeText,
+                                               source ?: "unknown");
+        }
+    }
+
+    YMGroupExitFlushingPending.store(false);
+}
+
+static void YMGroupExitBuildAbsoluteJump(uintptr_t targetAddress, uint8_t patch[16]) {
+    memset(patch, 0, 16);
+
+    uint32_t insnLdrX16 = 0x58000050; // ldr x16, #8
+    uint32_t insnBrX16  = 0xD61F0200; // br x16
+
+    memcpy(patch + 0, &insnLdrX16, sizeof(insnLdrX16));
+    memcpy(patch + 4, &insnBrX16, sizeof(insnBrX16));
+    memcpy(patch + 8, &targetAddress, sizeof(targetAddress));
+}
+
+static BOOL YMGroupExitWriteCodeBytes(uintptr_t address,
+                                      const uint8_t *bytes,
+                                      size_t size,
+                                      const char *name,
+                                      const char *stage) {
+    if (address == 0 || !bytes || size == 0) {
+        YMLog(@"[GroupExitMonitor] write code failed: invalid argument, name=%s stage=%s", name ?: "", stage ?: "");
+        return NO;
+    }
+
+    if (!YMProtectCodePage(address,
+                           size,
+                           VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY,
+                           name ?: "group exit hook",
+                           stage ?: "RW|COPY")) {
+        return NO;
+    }
+
+    memcpy((void *)address, bytes, size);
+    sys_icache_invalidate((void *)address, size);
+
+    if (!YMProtectCodePage(address,
+                           size,
+                           VM_PROT_READ | VM_PROT_EXECUTE,
+                           name ?: "group exit hook",
+                           "RX")) {
+        return NO;
+    }
+
+    return YES;
+}
+
+static BOOL YMGroupExitRestoreOriginalDBApply(void) {
+    if (!YMGroupExitDBApplyRuntimeAddress || !YMGroupExitHasSavedOriginalDBApplyBytes) {
+        return NO;
+    }
+
+    return YMGroupExitWriteCodeBytes(YMGroupExitDBApplyRuntimeAddress,
+                                     YMGroupExitOriginalDBApplyBytes,
+                                     sizeof(YMGroupExitOriginalDBApplyBytes),
+                                     "group exit DB apply",
+                                     "restore original");
+}
+
+static BOOL YMGroupExitReapplyDBApplyHook(void) {
+    if (!YMGroupExitDBApplyRuntimeAddress) {
+        return NO;
+    }
+
+    return YMGroupExitWriteCodeBytes(YMGroupExitDBApplyRuntimeAddress,
+                                     YMGroupExitHookDBApplyBytes,
+                                     sizeof(YMGroupExitHookDBApplyBytes),
+                                     "group exit DB apply",
+                                     "reapply hook");
+}
+
+static int64_t YMGroupExitCallOriginalDBApply(int64_t task) {
+    if (!YMGroupExitDBApplyRuntimeAddress) {
+        return 0;
+    }
+
+    if (YMGroupExitCallingOriginalDBApply.exchange(true)) {
+        YMLog(@"[GroupExitMonitor] recursive original DB apply call suppressed");
+        return 0;
+    }
+
+    BOOL restored = YMGroupExitRestoreOriginalDBApply();
+    if (!restored) {
+        YMLog(@"[GroupExitMonitor] restore original DB apply failed, skip calling original to avoid recursion");
+        YMGroupExitCallingOriginalDBApply.store(false);
+        return 0;
+    }
+
+    YMGroupExitDBApplyFunc Original =
+    (YMGroupExitDBApplyFunc)YMGroupExitDBApplyRuntimeAddress;
+
+    int64_t result = 0;
+    try {
+        result = Original(task);
+    } catch (...) {
+        YMLog(@"[GroupExitMonitor] exception while calling original DB apply");
+    }
+
+    YMGroupExitReapplyDBApplyHook();
+    YMGroupExitCallingOriginalDBApply.store(false);
+    return result;
+}
+
+static BOOL YMGroupExitRestoreOriginalFMessagePre(void) {
+    if (!YMGroupExitFMessagePreRuntimeAddress || !YMGroupExitHasSavedOriginalFMessagePreBytes) {
+        return NO;
+    }
+
+    return YMGroupExitWriteCodeBytes(YMGroupExitFMessagePreRuntimeAddress,
+                                     YMGroupExitOriginalFMessagePreBytes,
+                                     sizeof(YMGroupExitOriginalFMessagePreBytes),
+                                     "group exit fmessage_manager::InsertFMessageToSessionPre",
+                                     "restore original");
+}
+
+static BOOL YMGroupExitReapplyFMessagePreHook(void) {
+    if (!YMGroupExitFMessagePreRuntimeAddress) {
+        return NO;
+    }
+
+    return YMGroupExitWriteCodeBytes(YMGroupExitFMessagePreRuntimeAddress,
+                                     YMGroupExitHookFMessagePreBytes,
+                                     sizeof(YMGroupExitHookFMessagePreBytes),
+                                     "group exit fmessage_manager::InsertFMessageToSessionPre",
+                                     "reapply hook");
+}
+
+static void YMGroupExitCallOriginalFMessagePre(int64_t a1, int64_t *a2) {
+    if (!YMGroupExitFMessagePreRuntimeAddress) {
+        return;
+    }
+
+    if (YMGroupExitCallingOriginalFMessagePre.exchange(true)) {
+        YMLog(@"[GroupExitMonitor] recursive original FMessagePre call suppressed");
+        return;
+    }
+
+    BOOL restored = YMGroupExitRestoreOriginalFMessagePre();
+    if (!restored) {
+        YMLog(@"[GroupExitMonitor] restore original FMessagePre failed, skip calling original to avoid recursion");
+        YMGroupExitCallingOriginalFMessagePre.store(false);
+        return;
+    }
+
+    YMGroupExitFMessagePreFunc Original =
+    (YMGroupExitFMessagePreFunc)YMGroupExitFMessagePreRuntimeAddress;
+
+    try {
+        Original(a1, a2);
+    } catch (...) {
+        YMLog(@"[GroupExitMonitor] exception while calling original InsertFMessageToSessionPre");
+    }
+
+    YMGroupExitReapplyFMessagePreHook();
+    YMGroupExitCallingOriginalFMessagePre.store(false);
+}
+
+static BOOL YMGroupExitRestoreOriginalUpdateSessionCache(void) {
+    if (!YMGroupExitUpdateSessionCacheRuntimeAddress || !YMGroupExitHasSavedOriginalUpdateSessionCacheBytes) {
+        return NO;
+    }
+
+    return YMGroupExitWriteCodeBytes(YMGroupExitUpdateSessionCacheRuntimeAddress,
+                                     YMGroupExitOriginalUpdateSessionCacheBytes,
+                                     sizeof(YMGroupExitOriginalUpdateSessionCacheBytes),
+                                     "group exit session_service::UpdateSessionCache",
+                                     "restore original");
+}
+
+static BOOL YMGroupExitReapplyUpdateSessionCacheHook(void) {
+    if (!YMGroupExitUpdateSessionCacheRuntimeAddress) {
+        return NO;
+    }
+
+    return YMGroupExitWriteCodeBytes(YMGroupExitUpdateSessionCacheRuntimeAddress,
+                                     YMGroupExitHookUpdateSessionCacheBytes,
+                                     sizeof(YMGroupExitHookUpdateSessionCacheBytes),
+                                     "group exit session_service::UpdateSessionCache",
+                                     "reapply hook");
+}
+
+static void YMGroupExitCallOriginalUpdateSessionCache(uint64_t a1, int64_t a2, int64_t a3, int a4) {
+    if (!YMGroupExitUpdateSessionCacheRuntimeAddress) {
+        return;
+    }
+
+    if (YMGroupExitCallingOriginalUpdateSessionCache.exchange(true)) {
+        YMLog(@"[GroupExitMonitor] recursive original UpdateSessionCache call suppressed");
+        return;
+    }
+
+    BOOL restored = YMGroupExitRestoreOriginalUpdateSessionCache();
+    if (!restored) {
+        YMLog(@"[GroupExitMonitor] restore original UpdateSessionCache failed, skip calling original to avoid recursion");
+        YMGroupExitCallingOriginalUpdateSessionCache.store(false);
+        return;
+    }
+
+    YMGroupExitUpdateSessionCacheFunc Original =
+    (YMGroupExitUpdateSessionCacheFunc)YMGroupExitUpdateSessionCacheRuntimeAddress;
+
+    try {
+        Original(a1, a2, a3, a4);
+    } catch (...) {
+        YMLog(@"[GroupExitMonitor] exception while calling original UpdateSessionCache");
+    }
+
+    YMGroupExitReapplyUpdateSessionCacheHook();
+    YMGroupExitCallingOriginalUpdateSessionCache.store(false);
+}
+
+static int64_t YMGroupExitDBApplyHook(int64_t task) {
+    @autoreleasepool {
+        if (!YMIsGroupExitMonitorEnabled()) {
+            YMGroupExitClearRuntimeStateIfDisabled("DB apply hook");
+            return YMGroupExitCallOriginalDBApply(task);
+        }
+
+        NSDictionary<NSString *, NSSet<NSString *> *> *snapshots = YMGroupExitReadSnapshotsFromDBApplyTask(task);
+
+        int64_t result = YMGroupExitCallOriginalDBApply(task);
+
+        if (YMIsGroupExitMonitorEnabled()) {
+            YMGroupExitHandleDBApplySnapshots(snapshots, result);
+        } else {
+            YMGroupExitClearRuntimeStateIfDisabled("DB apply hook after original");
+        }
+
+        return result;
+    }
+}
+
+static void YMGroupExitFMessagePreHook(int64_t a1, int64_t *a2) {
+    @autoreleasepool {
+        YMGroupExitCallOriginalFMessagePre(a1, a2);
+
+        if (YMIsGroupExitMonitorEnabled()) {
+            YMGroupExitFlushPendingNotices("fmessage_manager InsertFMessageToSessionPre");
+        } else {
+            YMGroupExitClearRuntimeStateIfDisabled("fmessage_manager InsertFMessageToSessionPre");
+        }
+    }
+}
+
+static void YMGroupExitUpdateSessionCacheHook(uint64_t a1, int64_t a2, int64_t a3, int a4) {
+    @autoreleasepool {
+        YMGroupExitCallOriginalUpdateSessionCache(a1, a2, a3, a4);
+
+        if (YMIsGroupExitMonitorEnabled()) {
+            YMGroupExitFlushPendingNotices("session_service UpdateSessionCache");
+        } else {
+            YMGroupExitClearRuntimeStateIfDisabled("session_service UpdateSessionCache");
+        }
+    }
+}
+
+static BOOL YMPatchGroupExitSingleFunction(uintptr_t targetAddress,
+                                           uintptr_t hookAddress,
+                                           uint8_t originalBytes[16],
+                                           uint8_t hookBytes[16],
+                                           BOOL *hasSavedOriginalBytes,
+                                           uintptr_t *runtimeAddressStorage,
+                                           const char *name,
+                                           NSString *source) {
+    if (targetAddress == 0 || hookAddress == 0 || !originalBytes || !hookBytes || !hasSavedOriginalBytes || !runtimeAddressStorage) {
+        YMLog(@"[GroupExitMonitor] invalid single hook argument: %s", name ?: "");
+        return NO;
+    }
+
+    *runtimeAddressStorage = targetAddress;
+    YMGroupExitBuildAbsoluteJump(hookAddress, hookBytes);
+
+    uint8_t current[16] = {0};
+    memcpy(current, (void *)targetAddress, sizeof(current));
+
+    if (memcmp(current, hookBytes, sizeof(current)) == 0) {
+        YMLog(@"[GroupExitMonitor] %s already hooked, address=0x%lx source=%@",
+              name ?: "",
+              (unsigned long)targetAddress,
+              source ?: @"");
+        *hasSavedOriginalBytes = YES;
+        return YES;
+    }
+
+    memcpy(originalBytes, current, sizeof(current));
+    *hasSavedOriginalBytes = YES;
+
+    BOOL ok = YMGroupExitWriteCodeBytes(targetAddress,
+                                        hookBytes,
+                                        16,
+                                        name ?: "group exit hook",
+                                        "install hook");
+
+    YMLog(@"[GroupExitMonitor] hook result=%@ name=%s source=%@ target=0x%lx hook=0x%lx",
+          ok ? @"OK" : @"FAIL",
+          name ?: "",
+          source ?: @"",
+          (unsigned long)targetAddress,
+          (unsigned long)hookAddress);
+
+    return ok;
+}
+
+static BOOL YMPatchGroupExitMonitorWithSlide(intptr_t slide, NSString *source) {
+    if (YMHasPatchedGroupExitMonitor) {
+        YMLog(@"[GroupExitMonitor] already patched, skip. source=%@", source);
+        return YES;
+    }
+
+    if (!YMIsTargetWeChatVersion()) {
+        YMLog(@"[GroupExitMonitor] unsupported WeChat version, skip. source=%@", source);
+        return NO;
+    }
+
+    const YMWeChatAdaptProfile *profile = YMGetActiveProfile();
+    if (!YMGroupExitProfileReady(profile)) {
+        YMLog(@"[GroupExitMonitor] current profile has no group exit addresses, skip. profile=%s",
+              profile ? profile->displayName : "NULL");
+        return NO;
+    }
+
+    YMWeChatDylibSlide = (uintptr_t)slide;
+
+    uintptr_t dbApplyTarget = YMRuntimeAddress(profile->groupExitDBApplyVA);
+    uintptr_t fmessagePreTarget = YMRuntimeAddress(profile->groupExitFMessagePreVA);
+    uintptr_t updateSessionCacheTarget = YMRuntimeAddress(profile->groupExitUpdateSessionCacheVA);
+
+    uintptr_t dbApplyHook = (uintptr_t)&YMGroupExitDBApplyHook;
+    uintptr_t fmessagePreHook = (uintptr_t)&YMGroupExitFMessagePreHook;
+    uintptr_t updateSessionCacheHook = (uintptr_t)&YMGroupExitUpdateSessionCacheHook;
+
+    BOOL okDBApply = YMPatchGroupExitSingleFunction(dbApplyTarget,
+                                                   dbApplyHook,
+                                                   YMGroupExitOriginalDBApplyBytes,
+                                                   YMGroupExitHookDBApplyBytes,
+                                                   &YMGroupExitHasSavedOriginalDBApplyBytes,
+                                                   &YMGroupExitDBApplyRuntimeAddress,
+                                                   "group exit contact_storage chatroom_member DB apply",
+                                                   source);
+
+    BOOL okFMessagePre = YMPatchGroupExitSingleFunction(fmessagePreTarget,
+                                                       fmessagePreHook,
+                                                       YMGroupExitOriginalFMessagePreBytes,
+                                                       YMGroupExitHookFMessagePreBytes,
+                                                       &YMGroupExitHasSavedOriginalFMessagePreBytes,
+                                                       &YMGroupExitFMessagePreRuntimeAddress,
+                                                       "group exit fmessage_manager::InsertFMessageToSessionPre",
+                                                       source);
+
+    BOOL okUpdateSessionCache = YMPatchGroupExitSingleFunction(updateSessionCacheTarget,
+                                                              updateSessionCacheHook,
+                                                              YMGroupExitOriginalUpdateSessionCacheBytes,
+                                                              YMGroupExitHookUpdateSessionCacheBytes,
+                                                              &YMGroupExitHasSavedOriginalUpdateSessionCacheBytes,
+                                                              &YMGroupExitUpdateSessionCacheRuntimeAddress,
+                                                              "group exit session_service::UpdateSessionCache",
+                                                              source);
+
+    BOOL ok = okDBApply && okFMessagePre && okUpdateSessionCache;
+
+    YMLog(@"[GroupExitMonitor] patch result=%@ source=%@ profile=%s slide=0x%lx DBApply=0x%lx FMessagePre=0x%lx UpdateSessionCache=0x%lx",
+          ok ? @"OK" : @"FAIL",
+          source ?: @"",
+          profile->displayName,
+          (unsigned long)YMWeChatDylibSlide,
+          (unsigned long)dbApplyTarget,
+          (unsigned long)fmessagePreTarget,
+          (unsigned long)updateSessionCacheTarget);
+
+    YMHasPatchedGroupExitMonitor = ok;
+    return ok;
+}
+
+static BOOL YMFindAndPatchLoadedGroupExitWeChatDylib(void) {
+    uint32_t count = _dyld_image_count();
+
+    YMLog(@"[GroupExitMonitor] scan dyld images, count=%u", count);
+
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name) {
+            continue;
+        }
+
+        NSString *imagePath = [NSString stringWithUTF8String:name];
+
+        if (!YMIsTargetWeChatResourceDylibPath(imagePath)) {
+            continue;
+        }
+
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+
+        YMLog(@"[GroupExitMonitor] found Resources/wechat.dylib: index=%u, slide=0x%lx, path=%@",
+              i,
+              (unsigned long)slide,
+              imagePath);
+
+        return YMPatchGroupExitMonitorWithSlide(slide, @"dyld image scan");
+    }
+
+    YMLog(@"[GroupExitMonitor] Resources/wechat.dylib not found");
+    return NO;
+}
+
+static void YMInstallGroupExitMonitorPatch(void) {
+    if (!YMIsGroupExitMonitorEnabled()) {
+        YMLog(@"[GroupExitMonitor] disabled by user defaults, skip install");
+        YMGroupExitClearRuntimeStateIfDisabled("install skip");
+        return;
+    }
+
+    if (YMHasPatchedGroupExitMonitor) {
+        return;
+    }
+
+    YMRegisterDyldCallbackIfNeeded();
+    YMFindAndPatchLoadedGroupExitWeChatDylib();
+}
+
+
 #pragma mark - 撤回入口 Hook
 
 /*
  这个函数会被 off_91EAD20 热补丁指针调用。
 
  原函数签名：
-   __int64 ym_HandleSysMsg_RevokeMsg(__int64 a1, __int64 a2)
+   int64_t ym_HandleSysMsg_RevokeMsg(int64_t a1, int64_t a2)
 
  做两件事：
    1. 自己插入一条本地 type=10000 系统消息
@@ -1300,6 +2405,17 @@ static void YMDyldImageAdded(const struct mach_header *mh, intptr_t vmaddr_slide
     YMPatchMultiOpenWithWeChatDylibSlide(vmaddr_slide, @"dyld add image callback");
 
     /*
+     群员退群监控受 kExitChatroom 控制。
+     注意：dyld callback 是多开/防撤回共用的，不能在这里无条件安装退群 hook。
+     */
+    if (YMIsGroupExitMonitorEnabled()) {
+        YMPatchGroupExitMonitorWithSlide(vmaddr_slide, @"dyld add image callback");
+    } else {
+        YMLog(@"[GroupExitMonitor] disabled by user defaults, skip dyld callback patch");
+        YMGroupExitClearRuntimeStateIfDisabled("dyld add image callback");
+    }
+
+    /*
      防撤回仍然受用户开关控制。
      */
     if ([[NSUserDefaults standardUserDefaults] boolForKey:kAntiRevoke]) {
@@ -1381,6 +2497,20 @@ static void YMWeChatAntiRevokePatchEntry(void) {
         YMLog(@"constructor called");
         /// 多开必须尽早执行，不能 dispatch_after。
         YMInstallMultiOpenPatch();
+
+        BOOL exitChat = [[NSUserDefaults standardUserDefaults] boolForKey:kExitChatroom];
+        if (exitChat) {
+            YMInstallGroupExitMonitorPatch();
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                YMInstallGroupExitMonitorPatch();
+            });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                YMInstallGroupExitMonitorPatch();
+            });
+        }
+        
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{

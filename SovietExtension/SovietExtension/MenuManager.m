@@ -42,10 +42,17 @@
                                                 keyEquivalent:@""
                                                         state:NO];
     
+    BOOL flag_kExitChatroom = [[NSUserDefaults standardUserDefaults] boolForKey:kExitChatroom];
+    NSMenuItem *exitChatroomMenu= [NSMenuItem menuItemWithTitle:@"退群监控"
+                                                       action:@selector(onExitChatroom:)
+                                                       target:self
+                                                keyEquivalent:@""
+                                                        state:flag_kExitChatroom];
+    
    
     NSString *version = [NSString stringWithFormat:@"当前版本 %@", kCurrentVersion];
     NSMenuItem *currentVersionMenu= [NSMenuItem menuItemWithTitle:version
-                                                       action:@selector(onAntiRevoke:)
+                                                       action:nil
                                                        target:self
                                                 keyEquivalent:@""
                                                         state:NO];
@@ -53,6 +60,7 @@
     NSMenu *subMenu = [[NSMenu alloc] initWithTitle:@"苏维埃助手"];
     [subMenu addItems:@[antiUpdateMenu,
                         antiRevokeMenu,
+                        exitChatroomMenu,
                         newWeChatMenu,
                         currentVersionMenu
                       ]];
@@ -113,6 +121,28 @@
 - (void)onNewWeChat:(NSMenuItem *)item
 {
     [self executeShellCommand:@"open -n /Applications/WeChat.app"];
+}
+
+- (void)onExitChatroom:(NSMenuItem *)item
+{
+    BOOL enabled = item.state != NSControlStateValueOn;
+    
+    NSAlert *alert = [NSAlert alertWithMessageText:@"警告"
+                                     defaultButton:@"取消"
+                                   alternateButton:@"确定重启"
+                                       otherButton:nil
+                         informativeTextWithFormat:@"重启微信生效"];
+    NSUInteger action = [alert runModal];
+    if (action == NSAlertAlternateReturn) {
+        item.state = enabled ? NSControlStateValueOn : NSControlStateValueOff;
+        [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kExitChatroom];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [self restartWeChat];
+        });
+    }  else if (action == NSAlertDefaultReturn) {
+        
+    }
 }
 
 - (void)restartWeChat
