@@ -11,6 +11,7 @@
 #import "AntiUpdate.h"
 #import <Foundation/Foundation.h>
 #import <mach/mach.h>
+#import "RevokedMessageHighlight.h"
 #import <mach-o/dyld.h>
 #import <libkern/OSCacheControl.h>
 #import <unistd.h>
@@ -1511,6 +1512,13 @@ static BOOL YMInsertLocalAntiRevokeNotice(int64_t rawRevokeMessage) {
         int64_t result = InsertPaySysMsgToSession(0, session, &content);
 
         YMLog(@"insertPaySysMsgToSession result=0x%llx", (unsigned long long)result);
+
+        // 保存被撤回的消息信息，用于高亮显示
+        if (msgID.length > 0) {
+            [[RevokedMessageHighlight sharedInstance] saveRevokedMessageWithID:msgID
+                                                                 session:revokeSession
+                                                             replaceMsg:replaceMsg];
+        }
 
         ok = YES;
     } catch (...) {
