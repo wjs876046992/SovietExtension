@@ -2,8 +2,7 @@
 //  RevokedMessageHighlight.h
 //  SovietExtension
 //
-//  Created by SovietExtension on 2026/6/24.
-//  撤回消息高亮功能 - 轻量级实现
+//  撤回消息高亮功能
 //
 
 #import <Foundation/Foundation.h>
@@ -15,6 +14,9 @@
 
 /// 单例
 + (instancetype)sharedInstance;
+
+/// 初始化高亮功能
+- (void)setupHighlightHook;
 
 /// 存储被撤回的消息
 /// @param msgID 消息ID
