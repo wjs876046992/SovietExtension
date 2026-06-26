@@ -76,6 +76,13 @@
                                                 keyEquivalent:@""
                                                         state:NO];
     
+    BOOL flag_forward = [[NSUserDefaults standardUserDefaults] boolForKey:kRevokeForwardToSelfRealSend];
+    NSMenuItem *forwardMenu = [NSMenuItem menuItemWithTitle:@"撤回转发给我"
+                                                     action:@selector(onRevokeForwardToSelfRealSend:)
+                                                     target:self
+                                              keyEquivalent:@""
+                                                      state:flag_forward];
+   
     NSString *version = [NSString stringWithFormat:@"当前版本 %@", kCurrentVersion];
     NSMenuItem *currentVersionMenu = [NSMenuItem menuItemWithTitle:version
                                                             action:nil
@@ -89,6 +96,7 @@
         antiUpdateMenu,
         antiRevokeMenu,
         groupMenu,
+        forwardMenu,
         autoLoginMenu,
         useSystemWebMenu,
         newWeChatMenu,
@@ -139,6 +147,13 @@
     [self ym_confirmToggleMenuItem:item
                    userDefaultsKey:kAutoLogin
                    informativeText:@"重启微信生效"];
+}
+
+- (void)onRevokeForwardToSelfRealSend:(NSMenuItem *)item
+{
+    [self ym_confirmToggleMenuItem:item
+                   userDefaultsKey:kRevokeForwardToSelfRealSend
+                   informativeText:@"开启后，撤回的消息将转发到自己的会话，全设备同步。\n重启微信生效。"];
 }
 
 - (void)onUseSystemWeb:(NSMenuItem *)item
