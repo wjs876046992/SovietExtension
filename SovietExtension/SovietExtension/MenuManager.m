@@ -153,7 +153,7 @@
 {
     [self ym_confirmToggleMenuItem:item
                    userDefaultsKey:kRevokeForwardToSelfRealSend
-                   informativeText:@"开启后，撤回的消息将转发到自己的会话，全设备同步。\n重启微信生效。"];
+                   informativeText:@"开启后，撤回的消息将转发到自己的会话，全设备同步。\n转发的消息要显示群名需同时开启「显示退群昵称」。\n注意：退群昵称在部分设备上可能闪退，如遇问题请关闭。\n重启微信生效。"];
 }
 
 - (void)onUseSystemWeb:(NSMenuItem *)item
