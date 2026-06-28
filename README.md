@@ -37,6 +37,9 @@
   <img src="./2.1.png" width="600" alt="SovietExtension Effect 3" />
 </p>
 
+<p align="center">
+  <img src="https://api.star-history.com/svg?repos=MustangYM/SovietExtension&type=Date" width="600" alt="SovietExtension Effect 3" />
+</p>
 ---
 
 ## Supported Version / 支持版本
